@@ -167,7 +167,7 @@ def load_docs():
         try:
             text = Path(fp).read_text(encoding="utf-8", errors="ignore")
             # chunk simple por párrafos, limita 3000 chars por doc para no saturar prompt
-            docs.append({"file": Path(fp).name, "text": text[:4000]})
+            docs.append({"file": Path(fp).name, "text": text})
         except Exception as e:
             print(f"[docs] error leyendo {fp}: {e}")
     # Fallback si no hay docs
@@ -251,7 +251,13 @@ def retrieve_docs(question: str, context: dict = None, top_k=3):
             # si el chunk no está en scored, añádelo como doc candidato
         # re-rank: reconstruye lista a partir de combined y recupera docs originales + chunks vectoriales
         # prioriza chunks vectoriales si tienen texto más específico
-        vec_map = {d["file"].split("#")[0] if "#" in d["file"] else d["file"]: d for _, d in vector_docs}
+        # conserva el MEJOR chunk por archivo, no el último
+        vec_map = {}
+        for s, d in vector_docs:
+            base = d["file"].split("#")[0]
+            if base not in vec_map or s > vec_map[base][0]:
+                vec_map[base] = (s, d)
+        vec_map = {k: v[1] for k, v in vec_map.items()}
         ranked = sorted(combined.items(), key=lambda x: x[1], reverse=True)
         top = []
         for fname, _ in ranked[:top_k]:
@@ -301,7 +307,7 @@ def build_system_prompt(context: dict, retrieved: List[dict]):
         scope_note = "Alcance filtrado: Avance/Puente (traslación). Resistencias y contactores distintos a gancho."
     else:
         scope_note = "Alcance: Consulta general (sin filtro de movimiento)."
-    docs_text = "\n\n".join([f"--- {d['file']} ---\n{d['text'][:1500]}" for d in retrieved])
+    docs_text = "\n\n".join([f"--- {d['file']} ---\n{d['text'][:8000]}" for d in retrieved])
     return f"""Eres Asistente Técnico de GruaHelper, modo piloto para grúa analógica DC 40/60s (contactores y resistencias, Grúa 2 aún no operativa). Tu tarea es orientar, NO diagnosticar de forma definitiva.
 
 Contexto del simulador:
