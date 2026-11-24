@@ -63,8 +63,6 @@ IS_GROQ = ("groq" in OLLAMA_URL.lower() and GROQ_API_KEY != "")
 IS_DEEPSEEK = "deepseek" in OLLAMA_URL.lower() and DEEPSEEK_API_KEY != ""
 # prioridad: Groq si OLLAMA_URL es groq, sino DeepSeek si OLLAMA_URL es deepseek, sino Ollama local
 API_KEY = GROQ_API_KEY if IS_GROQ else (DEEPSEEK_API_KEY if IS_DEEPSEEK else "")
-# fallback automático: si Groq configurado pero falla, permite reintentar con DeepSeek si existe
-HAS_GROQ_FALLBACK = bool(GROQ_API_KEY and DEEPSEEK_API_KEY)
 
 # Aviso explícito para cambio de modelo futuro
 PROVIDER_NAME = "DeepSeek" if IS_DEEPSEEK else ("Groq" if IS_GROQ else "Ollama")
@@ -275,12 +273,16 @@ def retrieve_docs(question: str, context: dict = None, top_k=3):
         return top
 
 def build_system_prompt(context: dict, retrieved: List[dict]):
+    try:
+        _pos = int(context.get("position", 0))
+    except (TypeError, ValueError):
+        _pos = 0
     ctx_labels = {
         "crane": context.get("crane", "No especificada"),
         "module": context.get("module", "Consulta general"),
         "simulatorView": context.get("simulatorView", ""),
         "assistantScope": context.get("assistantScope", context.get("module", "consulta general")),
-        "position": context.get("position", 0),
+        "position": _pos,
         "activeContacts": ", ".join(context.get("activeContacts", [])) or "Ninguno",
     }
     position_text = "Neutro" if ctx_labels["position"] == 0 else (
@@ -328,7 +330,7 @@ Reglas obligatorias:
 11. PROPUESTA EXCLUSIONES (no verdad absoluta, pendiente validar): Owner propuso 7 reglas (H vs 1L excluyentes, DB solo neutro/-1, 1L→2L→3L secuencial, 1A→5A acumulativo, M requerido para H/1L, etc.) — aún no canónico. Verificar contra pClosedMap/aClosedMap y SECUENCIA_CANONICA antes de asumir.
 7. Responde SIEMPRE en JSON válido con esta estructura exacta, sin texto fuera del JSON (mode debe reflejar proveedor y modelo efectivo):
 {{
-  "mode": "API Groq (openai/gpt-oss-120b) si Groq, API local Ollama si Ollama",
+  "mode": "API {PROVIDER_NAME} ({EFFECTIVE_MODEL})",
   "summary": "Resumen breve",
   "facts": ["hecho 1"],
   "hypotheses": ["hipótesis 1"],
@@ -385,7 +387,7 @@ async def health():
             e_msg = ""
         return {
             "status": "ok",
-            "backend": "GruaHelper Groq Wrapper",
+            "backend": f"GruaHelper {PROVIDER_NAME} Wrapper",
             "ollama_url": OLLAMA_URL,
             "ollama_ok": groq_ok,
             "model_actual": EFFECTIVE_MODEL,
@@ -393,7 +395,7 @@ async def health():
             "ollama_models": model_names,
             "docs_loaded": len(DOCS_CACHE),
             "error": e_msg,
-            "provider": "groq",
+            "provider": PROVIDER_NAME.lower(),
         }
     else:
         try:
@@ -429,7 +431,7 @@ async def list_models():
                 r.raise_for_status()
                 return r.json()
         except Exception as e:
-            return JSONResponse(status_code=502, content={"error": str(e), "ollama_url": OLLAMA_URL, "provider": "groq"})
+            return JSONResponse(status_code=502, content={"error": str(e), "ollama_url": OLLAMA_URL, "provider": PROVIDER_NAME.lower()})
     else:
         try:
             async with httpx.AsyncClient(timeout=5) as client:
@@ -512,68 +514,31 @@ async def diagnostico(request: Request):
         }
         headers = {"Authorization": f"Bearer {API_KEY}", "Content-Type": "application/json"}
         endpoint = f"{OLLAMA_URL}/chat/completions"
-        try:
-            async with httpx.AsyncClient(timeout=180) as client:
-                r = await client.post(endpoint, json=payload, headers=headers)
-                r.raise_for_status()
-                data = r.json()
-                content = data.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
-        except Exception as e:
-            # Fallback a DeepSeek si Groq falla con 429 y hay key DeepSeek
-            err_str = str(e)
-            if HAS_GROQ_FALLBACK and ("429" in err_str or "Too Many Requests" in err_str):
-                try:
-                    ds_payload = {
-                        "model": DEEPSEEK_MODEL_DEFAULT,
-                        "messages": ollama_messages,
-                        "stream": False,
-                        "temperature": 0.2,
-                    }
-                    ds_headers = {"Authorization": f"Bearer {DEEPSEEK_API_KEY}", "Content-Type": "application/json"}
-                    ds_endpoint = "https://api.deepseek.com/chat/completions"
-                    async with httpx.AsyncClient(timeout=180) as ds_client:
-                        ds_r = await ds_client.post(ds_endpoint, json=ds_payload, headers=ds_headers)
-                        ds_r.raise_for_status()
-                        ds_data = ds_r.json()
-                        content = ds_data.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
-                        parsed = extract_json(content)
-                        if not parsed:
-                            parsed = {
-                                "mode": f"API DeepSeek fallback ({DEEPSEEK_MODEL_DEFAULT})",
-                                "summary": content[:300] if content else "Respuesta DeepSeek sin JSON",
-                                "facts": ["Fallback DeepSeek por Groq 429", f"Modelo: {DEEPSEEK_MODEL_DEFAULT}"],
-                                "hypotheses": [],
-                                "questions": [],
-                                "safety": ASSISTANT_SAFETY_NOTICE,
-                                "sources": ["DeepSeek fallback"]
-                            }
-                        HISTORIAL[session_id] = (HISTORIAL.get(session_id, []) + [{"role": "user", "content": question}, {"role": "assistant", "content": content}])[-MAX_HISTORIAL_TURNS*2:]
-                        return JSONResponse(content={
-                            "mode": parsed.get("mode", "DeepSeek fallback"),
-                            "summary": parsed.get("summary", ""),
-                            "facts": parsed.get("facts", []),
-                            "hypotheses": parsed.get("hypotheses", []),
-                            "questions": parsed.get("questions", []),
-                            "safety": parsed.get("safety", ASSISTANT_SAFETY_NOTICE),
-                            "sources": parsed.get("sources", ["DeepSeek fallback"]) + [r["file"] for r in retrieved[:2]],
-                            "_meta": {"model_usado": DEEPSEEK_MODEL_DEFAULT, "fallback": True}
-                        })
-                except Exception as ds_e:
-                    return JSONResponse(status_code=502, content={
-                        "mode": "Error Groq+DeepSeek",
-                        "summary": f"Groq falló: {e} | DeepSeek fallback falló: {ds_e}",
-                        "facts": [f"Modelo Groq: {requested_model}", f"Modelo DeepSeek: {DEEPSEEK_MODEL_DEFAULT}"],
-                        "hypotheses": [],
-                        "questions": [],
-                        "safety": ASSISTANT_SAFETY_NOTICE,
-                        "sources": []
-                    })
+        # Sin fallback a modelos gratuitos (Groq se cuelga por contexto/capacidad).
+        # Reintenta solo contra el mismo proveedor pago (DeepSeek) y falla rápido.
+        timeout = httpx.Timeout(connect=10.0, read=90.0, write=30.0, pool=10.0)
+        content = ""
+        last_err = None
+        for attempt in range(2):
+            try:
+                async with httpx.AsyncClient(timeout=timeout) as client:
+                    r = await client.post(endpoint, json=payload, headers=headers)
+                    r.raise_for_status()
+                    data = r.json()
+                    content = data.get("choices", [{}])[0].get("message", {}).get("content", "") or ""
+                last_err = None
+                break
+            except Exception as e:
+                last_err = e
+                if attempt == 0:
+                    await asyncio.sleep(1.5)
+        if last_err is not None:
             return JSONResponse(status_code=502, content={
-                "mode": "Error Groq",
-                "summary": f"No se pudo consultar Groq: {e}",
-                "facts": [f"Modelo: {requested_model}", f"Groq URL: {OLLAMA_URL}"],
+                "mode": f"Error {PROVIDER_NAME}",
+                "summary": f"No se pudo consultar {PROVIDER_NAME} ({EFFECTIVE_MODEL}): {last_err}",
+                "facts": [f"Modelo: {requested_model}", f"URL: {OLLAMA_URL}"],
                 "hypotheses": [],
-                "questions": [],
+                "questions": ["Reintenta en unos segundos."],
                 "safety": ASSISTANT_SAFETY_NOTICE,
                 "sources": []
             })
@@ -691,6 +656,9 @@ async def diagnostico_stream(request: Request):
             try:
                 async with httpx.AsyncClient(timeout=300) as client:
                     async with client.stream("POST", endpoint, json=payload, headers=headers) as r:
+                        if r.status_code >= 400:
+                            cuerpo = await r.aread()
+                            raise RuntimeError(f"{PROVIDER_NAME} HTTP {r.status_code}: {cuerpo[:300].decode('utf-8', 'replace')}")
                         async for line in r.aiter_lines():
                             if not line:
                                 continue
@@ -711,16 +679,19 @@ async def diagnostico_stream(request: Request):
                 try:
                     parsed = extract_json(full_content)
                     if not parsed:
-                        parsed = {"mode": f"API Groq ({requested_model}) - texto libre", "summary": full_content[:400], "facts": [], "hypotheses": [], "questions": [], "safety": ASSISTANT_SAFETY_NOTICE, "sources": [d["file"] for d in retrieved]}
+                        parsed = {"mode": f"API {PROVIDER_NAME} ({EFFECTIVE_MODEL}) - texto libre", "summary": full_content[:400], "facts": [], "hypotheses": [], "questions": [], "safety": ASSISTANT_SAFETY_NOTICE, "sources": [d["file"] for d in retrieved]}
                     else:
                         if isinstance(parsed.get("sources"), str):
                             parsed["sources"] = [parsed["sources"]]
+                    parsed["mode"] = f"API {PROVIDER_NAME} ({EFFECTIVE_MODEL})"
+                    parsed.setdefault("safety", ASSISTANT_SAFETY_NOTICE)
+                    parsed.setdefault("sources", [d["file"] for d in retrieved])
                     HISTORIAL[session_id] = (hist + [{"role": "user", "content": question}, {"role": "assistant", "content": json.dumps(parsed, ensure_ascii=False)}])[-MAX_HISTORIAL_TURNS*2:]
                     yield f"data: {json.dumps({'done': True, 'final': parsed}, ensure_ascii=False)}\n\n"
                 except Exception as e:
                     yield f"data: {json.dumps({'done': True, 'error': str(e)}, ensure_ascii=False)}\n\n"
             except Exception as e:
-                yield f"data: {json.dumps({'error': str(e)}, ensure_ascii=False)}\n\n"
+                yield f"data: {json.dumps({'done': True, 'error': str(e)}, ensure_ascii=False)}\n\n"
         return StreamingResponse(event_generator(), media_type="text/event-stream", headers={"Cache-Control": "no-cache", "Connection": "keep-alive", "X-Accel-Buffering": "no"})
     else:
         payload = {

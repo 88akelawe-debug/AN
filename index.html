@@ -625,6 +625,7 @@ async function askAssistant() {
           let buffer = '';
           let fullText = '';
           let finalPayload = null;
+          let streamError = null;
           while (true) {
             const chunk = await reader.read();
             if (chunk.done) break;
@@ -635,17 +636,22 @@ async function askAssistant() {
               if (part.indexOf('data:') === 0) {
                 const jsonStr = part.slice(5).trim();
                 if (!jsonStr) continue;
+                let evt;
                 try {
-                  const evt = JSON.parse(jsonStr);
-                  if (evt.token) {
-                    fullText += evt.token;
-                    // no muestra crudo, solo mantiene thinking
-                  }
-                  if (evt.done && evt.final) {
-                    finalPayload = evt.final;
-                  }
-                  if (evt.done && evt.error) throw new Error(evt.error);
-                } catch(e) {}
+                  evt = JSON.parse(jsonStr);
+                } catch(e) {
+                  continue;
+                }
+                if (evt.token) {
+                  fullText += evt.token;
+                  // no muestra crudo, solo mantiene thinking
+                }
+                if (evt.final) {
+                  finalPayload = evt.final;
+                }
+                if (evt.error) {
+                  streamError = evt.error;
+                }
               }
             }
           }
@@ -653,18 +659,23 @@ async function askAssistant() {
           clearTimeout(timer);
           if (finalPayload) {
             renderAssistantResponse(finalPayload);
+          } else if (streamError) {
+            throw new Error(streamError);
           } else if (fullText) {
             try {
               const parsed = JSON.parse(fullText);
               renderAssistantResponse(parsed);
             } catch(e) {
-              if (error) { error.textContent = 'Respuesta incompleta, revisa el streaming crudo arriba.'; error.classList.remove('hidden'); }
+              throw new Error('Respuesta incompleta del servicio.');
             }
+          } else {
+            throw new Error('El servicio no devolvió respuesta.');
           }
         }
       } catch(streamErr) {
-        // si streaming falla (red/proxy/SSE), cae a fallback no-stream abajo
+        // si streaming falla (red/proxy/SSE/error del proveedor), cae a fallback no-stream
         if (window._thinkingDotInt) { clearInterval(window._thinkingDotInt); window._thinkingDotInt=null; }
+        usedStream = false;
       }
       if (!usedStream) {
         const response = await fetch(ASSISTANT_CONFIG.endpoint, {
@@ -674,7 +685,14 @@ async function askAssistant() {
           body: JSON.stringify({ question: question, context: context, sessionId: sessionId })
         });
         clearTimeout(timer);
-        if (!response.ok) throw new Error('El servicio devolvió el estado ' + response.status + '.');
+        if (!response.ok) {
+          let msg = 'El servicio devolvió el estado ' + response.status + '.';
+          try {
+            const j = await response.json();
+            if (j && j.summary) msg = j.summary;
+          } catch(e) {}
+          throw new Error(msg);
+        }
         const payload = await response.json();
         renderAssistantResponse(payload);
       } else {
